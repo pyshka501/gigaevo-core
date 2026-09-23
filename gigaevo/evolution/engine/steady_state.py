@@ -23,6 +23,7 @@ from gigaevo.evolution.engine.core import EvolutionEngine
 from gigaevo.evolution.engine.dispatcher import dispatcher_loop
 from gigaevo.evolution.engine.ingestor import ingestor_loop, poll_and_ingest
 from gigaevo.evolution.engine.refresh import ParentRefresher, ParentRefreshTicket
+from gigaevo.programs.program_state import ProgramState
 
 
 class SteadyStateEvolutionEngine(EvolutionEngine):
@@ -70,6 +71,43 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
         # of producer/buffer/in_flight held counts. Lifecycle mirrors the
         # dispatcher/ingestor tasks (start in run(), cancel in finally).
         self._sampler_task: asyncio.Task | None = None
+        # This is only a local producer/registered-child drain. It is not a
+        # durable checkpoint and must never be reported as pause/resume.
+        self._producer_drain_completed = False
+
+    def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return super().start()
+        if self._producer_drain_requested:
+            raise RuntimeError(
+                "producer drain was requested; construct a new engine for a new run"
+            )
+        super().start()
+
+    def request_producer_drain(self) -> None:
+        """Stop new mutant dispatch without cancelling in-flight producers.
+
+        This request is sticky and local to this engine instance. It does not
+        create a checkpoint or establish paid-evaluation replay safety.
+        """
+        if not self._running:
+            raise RuntimeError("producer drain requires a running engine")
+        self._producer_drain_requested = True
+
+    async def wait_for_producer_drain(self, *, timeout_s: float) -> None:
+        """Wait for this engine task to finish its requested local drain.
+
+        A caller timeout/cancellation does not cancel the engine: outstanding
+        evaluations continue toward a terminal outcome. A successful return
+        is not a durable pause acknowledgement.
+        """
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        if not self._producer_drain_requested or self._task is None:
+            raise RuntimeError("no active producer drain request")
+        await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout_s)
+        if not self._producer_drain_completed:
+            raise RuntimeError("producer drain did not complete")
 
     async def run(self) -> None:
         logger.info(
@@ -132,13 +170,18 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
             # ingestor alive until all registered child DAGs have terminal,
             # durable outcomes.
             decision = await self._dispatcher_task
-            completion_reason = decision.code or (
-                "stopper_reached" if decision.stop else "dispatcher_completed"
+            completion_reason = (
+                "producer_drain_requested"
+                if self._producer_drain_requested
+                else decision.code
+                or ("stopper_reached" if decision.stop else "dispatcher_completed")
             )
-            await self._await_terminal_drain()
+            await self._await_terminal_drain(strict=self._producer_drain_requested)
             terminally_drained = True
             self._running = False
             await self._ingestor_task
+            if self._producer_drain_requested:
+                self._producer_drain_completed = True
 
         except asyncio.CancelledError:
             completion_reason = "external_signal"
@@ -202,7 +245,7 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
                 # otherwise dangle in __context__ and mislead the operator.
                 raise asyncio.CancelledError from None
 
-    async def _await_terminal_drain(self) -> None:
+    async def _await_terminal_drain(self, *, strict: bool = False) -> None:
         """Wait for every registered child to reach a durable terminal record.
 
         Two bounds apply. ``post_cap_drain_grace_s`` (when set) is the intended
@@ -215,7 +258,9 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
         the grace to ``None`` to restore the legacy drain-or-raise contract.
         """
 
-        grace_s = self._ss_config.post_cap_drain_grace_s
+        # A requested drain must never take the cap path that returns with
+        # stragglers after a short grace period.
+        grace_s = None if strict else self._ss_config.post_cap_drain_grace_s
         # Resolve both bounds from one start so their ordering is exact, then let
         # the *earlier* deadline decide the outcome — even when the loop wakes
         # past both at once (a stalled loop / slow NFS). grace-first returns
@@ -229,7 +274,11 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
             async with self._in_flight_lock:
                 pending = tuple(sorted(self._in_flight))
             if not pending:
-                return
+                # Registered children are not the whole scheduler: a producer
+                # could have persisted a child before its registration. Keep
+                # waiting while any QUEUED/RUNNING storage record remains.
+                if not strict or not await self._has_active_dags():
+                    return
             if self._ingestor_task is not None and self._ingestor_task.done():
                 if self._ingestor_task.cancelled():
                     raise RuntimeError("ingestor cancelled during terminal drain")
@@ -252,6 +301,15 @@ class SteadyStateEvolutionEngine(EvolutionEngine):
                 )
                 return
             if now >= drain_deadline:
+                if strict and not pending:
+                    queued, running = await asyncio.gather(
+                        self.storage.count_by_status(ProgramState.QUEUED.value),
+                        self.storage.count_by_status(ProgramState.RUNNING.value),
+                    )
+                    raise TimeoutError(
+                        "terminal drain timed out with no registered children "
+                        f"but queued={queued}, running={running} storage programs"
+                    )
                 raise TimeoutError(
                     "terminal drain timed out with "
                     f"{len(pending)} child(ren) pending: {list(pending[:10])}"
