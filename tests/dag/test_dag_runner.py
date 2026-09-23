@@ -680,6 +680,85 @@ class TestDagRunnerExecuteDag:
         # fast_state_transition should NOT be called (batched instead)
         storage.fast_state_transition.assert_not_called()
 
+    async def test_done_write_failure_retains_result_and_skips_orphan(self):
+        """A transient Redis failure must not discard a completed paid DAG."""
+        prog = _make_test_program(state=ProgramState.RUNNING)
+        storage = _make_mock_storage()
+        storage.get_ids_by_status = AsyncMock(
+            side_effect=lambda state: (
+                [prog.id] if state == ProgramState.RUNNING.value else []
+            )
+        )
+        writes = 0
+
+        async def write_done(programs, old_state, new_state):
+            nonlocal writes
+            writes += 1
+            assert programs == [prog]
+            assert old_state == ProgramState.RUNNING.value
+            assert new_state == ProgramState.DONE.value
+            if writes == 1:
+                # RedisProgramStorage mutates the in-memory program before its
+                # non-transactional pipeline has confirmed the write.
+                prog.state = ProgramState.DONE
+                raise RuntimeError("injected Redis write failure")
+            return len(programs)
+
+        storage.batch_transition_state = AsyncMock(side_effect=write_done)
+        runner = _make_runner(storage=storage)
+        dag = _make_mock_dag()
+
+        await runner._execute_dag(dag, prog)
+        assert dag.run.await_count == 1
+        await runner._flush_done_queue()
+        assert runner._done_queue == [prog]
+
+        await runner._launch()
+        storage.mget.assert_not_awaited()
+        storage.fast_state_transition.assert_not_awaited()
+        assert runner._metrics.orphaned_programs_discarded == 0
+
+        await runner._flush_done_queue()
+        assert runner._done_queue == []
+        assert writes == 2
+        assert dag.run.await_count == 1
+
+    async def test_concurrent_done_flushes_write_batch_once(self):
+        """A scheduler flush and an eager DAG flush cannot race the same batch."""
+        prog = _make_test_program(state=ProgramState.RUNNING)
+        storage = _make_mock_storage()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def write_done(programs, old_state, new_state):
+            entered.set()
+            await release.wait()
+            return len(programs)
+
+        storage.batch_transition_state = AsyncMock(side_effect=write_done)
+        runner = _make_runner(storage=storage)
+        runner._done_queue.append(prog)
+
+        first = asyncio.create_task(runner._flush_done_queue())
+        await entered.wait()
+        second = asyncio.create_task(runner._flush_done_queue())
+        release.set()
+        await asyncio.gather(first, second)
+
+        storage.batch_transition_state.assert_awaited_once()
+        assert runner._done_queue == []
+
+    async def test_incomplete_done_batch_acknowledgement_retains_result(self):
+        prog = _make_test_program(state=ProgramState.RUNNING)
+        storage = _make_mock_storage()
+        storage.batch_transition_state = AsyncMock(return_value=0)
+        runner = _make_runner(storage=storage)
+        runner._done_queue.append(prog)
+
+        await runner._flush_done_queue()
+
+        assert runner._done_queue == [prog]
+
     async def test_failure_sets_discarded(self):
         """Mock DAG.run() to raise, verify state becomes DISCARDED."""
         prog = _make_test_program(state=ProgramState.RUNNING)

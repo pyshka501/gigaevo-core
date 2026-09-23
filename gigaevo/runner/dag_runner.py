@@ -186,6 +186,7 @@ class DagRunner:
         # here instead of writing individually.  _maintain flushes with
         # batch_transition_state (bulk SREM/SADD — 2 commands instead of 2N).
         self._done_queue: list[Program] = []
+        self._done_flush_lock = asyncio.Lock()
 
         # async metrics collector task (no threads)
         self._metrics_collector_task: asyncio.Task | None = None
@@ -376,7 +377,14 @@ class DagRunner:
             return
 
         # Phase 2: handle orphaned RUNNING programs (fetch full data only for these)
-        orphaned_ids = [pid for pid in running_ids if pid not in self._active]
+        # A completed DAG may still be RUNNING in Redis if its DONE write failed.
+        # Its in-memory result must be retried, not converted to an orphan.
+        pending_done_ids = {program.id for program in self._done_queue}
+        orphaned_ids = [
+            pid
+            for pid in running_ids
+            if pid not in self._active and pid not in pending_done_ids
+        ]
         if orphaned_ids:
             try:
                 orphaned = await self._storage.mget(orphaned_ids)
@@ -548,24 +556,33 @@ class DagRunner:
 
     async def _flush_done_queue(self) -> None:
         """Batch-transition queued DONE programs to Redis."""
-        if not self._done_queue:
-            return
-        batch = self._done_queue[:]
-        self._done_queue.clear()
-        try:
-            await self._storage.batch_transition_state(
-                batch,
-                ProgramState.RUNNING.value,
-                ProgramState.DONE.value,
-            )
+        async with self._done_flush_lock:
+            if not self._done_queue:
+                return
+            batch = self._done_queue[:]
+            try:
+                persisted = await self._storage.batch_transition_state(
+                    batch,
+                    ProgramState.RUNNING.value,
+                    ProgramState.DONE.value,
+                )
+                if persisted != len(batch):
+                    raise RuntimeError(
+                        f"DONE batch acknowledged {persisted}/{len(batch)} programs"
+                    )
+            except Exception as e:
+                # The outcome may have been partly written. Retain it until a
+                # successful retry acknowledges the whole batch; _launch also
+                # excludes these IDs from orphan reconciliation.
+                logger.error(
+                    "[DagScheduler] batch RUNNING→DONE failed for {} programs: {}",
+                    len(batch),
+                    e,
+                )
+                return
+            del self._done_queue[: len(batch)]
             logger.debug(
                 "[DagScheduler] batch RUNNING→DONE for {} programs", len(batch)
-            )
-        except Exception as e:
-            logger.error(
-                "[DagScheduler] batch RUNNING→DONE failed for {} programs: {}",
-                len(batch),
-                e,
             )
 
     async def _cancel_task(self, info: TaskInfo) -> None:
