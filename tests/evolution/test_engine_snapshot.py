@@ -9,8 +9,10 @@ from gigaevo.evolution.engine.core import EvolutionEngine
 from gigaevo.evolution.engine.snapshot import (
     ENGINE_SNAPSHOT_KEY,
     EngineSnapshot,
+    SnapshotUnavailableError,
     get_current_snapshot,
     load_engine_snapshot,
+    load_required_engine_snapshot,
 )
 
 
@@ -67,6 +69,83 @@ async def test_load_engine_snapshot_tolerates_corrupt_json():
     storage = _StubStorage(payload="{not json")
     snap = await load_engine_snapshot(storage)
     assert snap == EngineSnapshot()
+
+
+@pytest.mark.asyncio
+async def test_required_snapshot_round_trips_complete_versioned_state():
+    expected = EngineSnapshot(
+        total_mutants=7,
+        next_iteration=9,
+        programs_processed=12,
+        completion_reason=None,
+        version=3,
+    )
+    assert (
+        await load_required_engine_snapshot(
+            _StubStorage(payload=expected.model_dump_json())
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_snapshot_reads_persisted_redis_state(fakeredis_storage):
+    expected = EngineSnapshot(total_mutants=10, next_iteration=10, version=4)
+    await fakeredis_storage.save_run_state(
+        ENGINE_SNAPSHOT_KEY, expected.model_dump_json()
+    )
+    assert await load_required_engine_snapshot(fakeredis_storage) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (None, "missing"),
+        ("{not json", "invalid"),
+        ("[]", "invalid"),
+        ('{"version": 2}', "invalid"),
+        (EngineSnapshot().model_dump_json(), "invalid"),
+        (EngineSnapshot(version=-1).model_dump_json(), "invalid"),
+        (
+            EngineSnapshot(version=2)
+            .model_dump_json()
+            .replace('"version":2', '"version":true'),
+            "invalid",
+        ),
+        (
+            EngineSnapshot(version=2)
+            .model_dump_json()
+            .replace('"total_mutants":0', '"total_mutants":-1'),
+            "invalid",
+        ),
+        (
+            EngineSnapshot(version=2)
+            .model_dump_json()
+            .replace('"version":2', '"version":"2"'),
+            "invalid",
+        ),
+        (
+            EngineSnapshot(version=2)
+            .model_dump_json()
+            .replace('"version":2', '"version":2,"version":3'),
+            "invalid",
+        ),
+    ],
+)
+async def test_required_snapshot_fails_closed(payload, message):
+    with pytest.raises(SnapshotUnavailableError, match=message):
+        await load_required_engine_snapshot(_StubStorage(payload=payload))
+
+
+@pytest.mark.asyncio
+async def test_required_snapshot_keeps_storage_failure_distinct():
+    class FailedStorage(_StubStorage):
+        async def load_run_state_str(self, field: str) -> str | None:
+            raise ConnectionError("Redis unavailable")
+
+    with pytest.raises(ConnectionError, match="Redis unavailable"):
+        await load_required_engine_snapshot(FailedStorage())
 
 
 @pytest.fixture

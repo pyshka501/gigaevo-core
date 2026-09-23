@@ -18,6 +18,7 @@ call ``load_engine_snapshot(storage)``.
 
 from __future__ import annotations
 
+import json
 from typing import Protocol
 
 from loguru import logger
@@ -34,6 +35,10 @@ class EngineSnapshot(BaseModel):
     version: int = 0
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class SnapshotUnavailableError(ValueError):
+    """A saved engine snapshot cannot be used as a pause checkpoint input."""
 
 
 class _SnapshotStorage(Protocol):
@@ -75,3 +80,46 @@ async def load_engine_snapshot(storage: _SnapshotStorage) -> EngineSnapshot:
             "[EngineSnapshot] snapshot JSON corrupt ({}); returning defaults", exc
         )
         return EngineSnapshot()
+
+
+async def load_required_engine_snapshot(storage: _SnapshotStorage) -> EngineSnapshot:
+    """Load a complete, versioned engine snapshot without fallback defaults.
+
+    This is one prerequisite for a future quiescent-pause checkpoint. It does
+    not establish that work has drained, that strategy state is durable, or
+    that Redis itself has been fsynced. Ordinary crash resume intentionally
+    continues to use ``load_engine_snapshot`` and its legacy fallback.
+    """
+    raw = await storage.load_run_state_str(ENGINE_SNAPSHOT_KEY)
+    if raw is None:
+        raise SnapshotUnavailableError("engine snapshot is missing")
+
+    def reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for key, value in pairs:
+            if key in values:
+                raise ValueError(f"duplicate field: {key}")
+            values[key] = value
+        return values
+
+    try:
+        data = json.loads(raw, object_pairs_hook=reject_duplicate_fields)
+        if not isinstance(data, dict):
+            raise ValueError("snapshot is not an object")
+        if set(data) != set(EngineSnapshot.model_fields):
+            raise ValueError("snapshot fields are incomplete or unexpected")
+        snapshot = EngineSnapshot.model_validate(data, strict=True)
+        if snapshot.version < 1:
+            raise ValueError("snapshot has no persisted version")
+        if (
+            min(
+                snapshot.total_mutants,
+                snapshot.next_iteration,
+                snapshot.programs_processed,
+            )
+            < 0
+        ):
+            raise ValueError("snapshot counters must be non-negative")
+    except (TypeError, ValueError) as exc:
+        raise SnapshotUnavailableError("engine snapshot is invalid") from exc
+    return snapshot
