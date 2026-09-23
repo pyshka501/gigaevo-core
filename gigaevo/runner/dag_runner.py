@@ -389,6 +389,10 @@ class DagRunner:
             try:
                 orphaned = await self._storage.mget(orphaned_ids)
                 for p in [p for p in orphaned if p is not None]:
+                    # The RUNNING ID snapshot can predate a successful DONE
+                    # flush. Never discard a record that is already terminal.
+                    if p.state != ProgramState.RUNNING:
+                        continue
                     try:
                         set_mutation_terminal_failure(
                             p, MutationTerminalFailureStage.SCHEDULER_ORPHAN

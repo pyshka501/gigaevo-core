@@ -346,6 +346,21 @@ class TestDagRunnerLaunch:
         call_args = storage.fast_state_transition.call_args
         assert call_args[0][2] == ProgramState.DISCARDED.value
 
+    async def test_stale_running_snapshot_does_not_discard_completed_record(self):
+        """A DONE flush may complete after SMEMBERS but before orphan MGET."""
+        prog = _make_test_program(state=ProgramState.DONE)
+        storage = _make_mock_storage()
+        storage.get_ids_by_status = AsyncMock(
+            side_effect=lambda s: [prog.id] if s == ProgramState.RUNNING.value else []
+        )
+        storage.mget = AsyncMock(return_value=[prog])
+
+        runner = _make_runner(storage=storage)
+        await runner._launch()
+
+        assert runner._metrics.orphaned_programs_discarded == 0
+        storage.fast_state_transition.assert_not_called()
+
     async def test_mark_running_failure_cancels_task_and_removes_from_active(self):
         """If batch_transition_by_ids raises after task creation, tasks are cancelled."""
         prog = _make_test_program(state=ProgramState.QUEUED)
