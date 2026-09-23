@@ -86,6 +86,7 @@ class EvolutionEngine:
         self._writer = writer.bind(path=["evolution_engine"])
 
         self._running = False
+        self._producer_drain_requested = False
         self._terminal_stop_decision: StopDecision | None = None
         self._resumed = False
         self._last_pending_dags_counts: tuple[int, int] | None = None
@@ -706,6 +707,10 @@ class EvolutionEngine:
     def _can_dispatch_mutant(self, *, reserved: int) -> bool:
         """Authorize one dispatch while accounting for concurrent reservations."""
 
+        # A producer-drain request is a one-way gate for this engine instance.
+        # The dispatcher checks this both before and after acquiring its slot.
+        if self._producer_drain_requested:
+            return False
         if self._terminal_stop_decision is not None:
             return False
         context = self.build_stop_context()
